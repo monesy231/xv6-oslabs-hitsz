@@ -45,6 +45,81 @@ void kvminit() {
   kvmmap(TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
 }
 
+// Print valid entries, carrying the virtual-address prefix down the tree.
+static void vmprint_level(pagetable_t pagetable, int level, uint64 prefix) {
+  for (int i = 0; i < 512; i++) {
+    pte_t pte = pagetable[i];
+    if ((pte & PTE_V) == 0) continue;
+    uint64 va = prefix | ((uint64)i << PXSHIFT(level));
+    uint64 pa = PTE2PA(pte);
+    char flags[] = "----";
+    if (pte & PTE_R) flags[0] = 'r';
+    if (pte & PTE_W) flags[1] = 'w';
+    if (pte & PTE_X) flags[2] = 'x';
+    if (pte & PTE_U) flags[3] = 'u';
+    for (int depth = 2; depth > level; depth--) printf("||   ");
+    printf("||idx: %d: ", i);
+    if (pte & (PTE_R | PTE_W | PTE_X)) {
+      printf("va: %p -> pa: %p, flags: %s\n", va, pa, flags);
+    } else {
+      printf("pa: %p, flags: %s\n", pa, flags);
+      if (level > 0) vmprint_level((pagetable_t)pa, level - 1, va);
+    }
+  }
+}
+
+void vmprint(pagetable_t pagetable) {
+  printf("page table %p\n", pagetable);
+  vmprint_level(pagetable, 2, 0);
+}
+
+// Free only page-table pages; mapped memory belongs to other owners.
+static void kvmfreewalk(pagetable_t pagetable) {
+  for (int i = 0; i < 512; i++) {
+    pte_t pte = pagetable[i];
+    if ((pte & PTE_V) && (pte & (PTE_R | PTE_W | PTE_X)) == 0)
+      kvmfreewalk((pagetable_t)PTE2PA(pte));
+    pagetable[i] = 0;
+  }
+  kfree((void *)pagetable);
+}
+
+// The low 96 L1 entries borrow L0 tables owned by the user page table.
+void kvmfree(pagetable_t pagetable) {
+  if (pagetable[0] & PTE_V) {
+    pagetable_t l1 = (pagetable_t)PTE2PA(pagetable[0]);
+    for (int i = 0; i < PX(1, PLIC); i++) l1[i] = 0;
+  }
+  kvmfreewalk(pagetable);
+}
+
+// Per-process kernel mappings. CLINT stays in the global table only.
+pagetable_t kvmcreate(void) {
+  pagetable_t pagetable = uvmcreate();
+  if (pagetable == 0) return 0;
+  if (mappages(pagetable, UART0, PGSIZE, UART0, PTE_R | PTE_W) < 0 ||
+      mappages(pagetable, VIRTIO0, PGSIZE, VIRTIO0, PTE_R | PTE_W) < 0 ||
+      mappages(pagetable, PLIC, 0x400000, PLIC, PTE_R | PTE_W) < 0 ||
+      mappages(pagetable, KERNBASE, (uint64)etext - KERNBASE, KERNBASE,
+               PTE_R | PTE_X) < 0 ||
+      mappages(pagetable, (uint64)etext, PHYSTOP - (uint64)etext, (uint64)etext,
+               PTE_R | PTE_W) < 0 ||
+      mappages(pagetable, TRAMPOLINE, PGSIZE, (uint64)trampoline, PTE_R | PTE_X) < 0) {
+    kvmfree(pagetable);
+    return 0;
+  }
+  return pagetable;
+}
+
+// Device mappings ensure the private table already has its low L1 page.
+// Replace all borrowed entries, including absent ones after exec/shrink.
+void sync_pagetable(pagetable_t user, pagetable_t kernel) {
+  pagetable_t dst = (pagetable_t)PTE2PA(kernel[0]);
+  pagetable_t src = (user[0] & PTE_V) ? (pagetable_t)PTE2PA(user[0]) : 0;
+  for (int i = 0; i < PX(1, PLIC); i++) dst[i] = src ? src[i] : 0;
+  sfence_vma();
+}
+
 // Switch h/w page table register to the kernel's page table,
 // and enable paging.
 void kvminithart() {
@@ -191,6 +266,7 @@ uint64 uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz) {
   char *mem;
   uint64 a;
 
+  if (newsz > PLIC) return 0;
   if (newsz < oldsz) return oldsz;
 
   oldsz = PGROUNDUP(oldsz);
@@ -312,64 +388,47 @@ int copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len) {
   return 0;
 }
 
+// Find the readable user prefix without translating the data address to PA.
+// Limit strings at the first inaccessible page, so an earlier NUL still works.
+static uint64 user_readable(pagetable_t pagetable, uint64 va, uint64 len) {
+  uint64 done = 0;
+  if (va >= PLIC) return 0;
+  if (len > PLIC - va) len = PLIC - va;
+  while (done < len) {
+    pte_t *pte = walk(pagetable, va + done, 0);
+    int perm = PTE_V | PTE_U | PTE_R;
+    if (pte == 0 || (*pte & perm) != perm) break;
+    uint64 n = PGSIZE - ((va + done) % PGSIZE);
+    if (n > len - done) n = len - done;
+    done += n;
+  }
+  return done;
+}
+
 // Copy from user to kernel.
 // Copy len bytes to dst from virtual address srcva in a given page table.
 // Return 0 on success, -1 on error.
 int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
-  uint64 n, va0, pa0;
-
-  while (len > 0) {
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if (pa0 == 0) return -1;
-    n = PGSIZE - (srcva - va0);
-    if (n > len) n = len;
-    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
-
-    len -= n;
-    dst += n;
-    srcva = va0 + PGSIZE;
-  }
-  return 0;
+  if (user_readable(pagetable, srcva, len) != len) return -1;
+  push_off();
+  uint64 sum = r_sstatus() & SSTATUS_SUM;
+  w_sstatus(r_sstatus() | SSTATUS_SUM);
+  int result = copyin_new(pagetable, dst, srcva, len);
+  w_sstatus((r_sstatus() & ~SSTATUS_SUM) | sum);
+  pop_off();
+  return result;
 }
 
-// Copy a null-terminated string from user to kernel.
-// Copy bytes to dst from virtual address srcva in a given page table,
-// until a '\0', or max.
-// Return 0 on success, -1 on error.
+// Copy a user string with hardware translation through the shared mappings.
 int copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max) {
-  uint64 n, va0, pa0;
-  int got_null = 0;
-
-  while (got_null == 0 && max > 0) {
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if (pa0 == 0) return -1;
-    n = PGSIZE - (srcva - va0);
-    if (n > max) n = max;
-
-    char *p = (char *)(pa0 + (srcva - va0));
-    while (n > 0) {
-      if (*p == '\0') {
-        *dst = '\0';
-        got_null = 1;
-        break;
-      } else {
-        *dst = *p;
-      }
-      --n;
-      --max;
-      p++;
-      dst++;
-    }
-
-    srcva = va0 + PGSIZE;
-  }
-  if (got_null) {
-    return 0;
-  } else {
-    return -1;
-  }
+  max = user_readable(pagetable, srcva, max);
+  push_off();
+  uint64 sum = r_sstatus() & SSTATUS_SUM;
+  w_sstatus(r_sstatus() | SSTATUS_SUM);
+  int result = copyinstr_new(pagetable, dst, srcva, max);
+  w_sstatus((r_sstatus() & ~SSTATUS_SUM) | sum);
+  pop_off();
+  return result;
 }
 
 // check if use global kpgtbl or not
