@@ -14,20 +14,40 @@ void freerange(void *pa_start, void *pa_end);
 extern char end[]; // first address after kernel.
                    // defined by kernel.ld.
 
+// 复用空闲页的页首保存 next，不额外分配链表节点。
 struct run {
   struct run *next;
 };
 
+// 每 CPU 一条空闲链表、一把锁，减少不同 CPU 之间的争用。
 struct {
   struct spinlock lock;
   struct run *freelist;
-} kmem;
+} kmem[NCPU];
+
+// 一次最多借 32 页，减少频繁借页，也限制持锁时间。
+#define STEAL_BATCH 32
 
 void
 kinit()
 {
-  initlock(&kmem.lock, "kmem");
+  for(int i = 0; i < NCPU; i++)
+    initlock(&kmem[i].lock, "kmem");
   freerange(end, (void*)PHYSTOP);
+
+  // 其他 CPU 仍在 main() 等待 started，此时可直接重分空闲页。
+  // 轮流放入 NCPU 条链表，避免启动时都向同一 CPU 借页。
+  push_off();
+  int id = cpuid();
+  struct run *r = kmem[id].freelist;
+  kmem[id].freelist = 0;
+  for(int target = 0; r; target = (target + 1) % NCPU){
+    struct run *next = r->next;
+    r->next = kmem[target].freelist;
+    kmem[target].freelist = r;
+    r = next;
+  }
+  pop_off();
 }
 
 void
@@ -56,10 +76,15 @@ kfree(void *pa)
 
   r = (struct run*)pa;
 
-  acquire(&kmem.lock);
-  r->next = kmem.freelist;
-  kmem.freelist = r;
-  release(&kmem.lock);
+  // 关中断固定 CPU 编号；跨 CPU 的链表访问仍靠自旋锁互斥。
+  push_off();
+  int id = cpuid();
+  acquire(&kmem[id].lock);
+  // 归还当前 CPU 即可，不必回到最初分配它的 CPU。
+  r->next = kmem[id].freelist;
+  kmem[id].freelist = r;
+  release(&kmem[id].lock);
+  pop_off();
 }
 
 // Allocate one 4096-byte page of physical memory.
@@ -70,11 +95,45 @@ kalloc(void)
 {
   struct run *r;
 
-  acquire(&kmem.lock);
-  r = kmem.freelist;
+  // 优先取本地空闲页，常见路径只需本地锁。
+  push_off();
+  int id = cpuid();
+  acquire(&kmem[id].lock);
+  r = kmem[id].freelist;
   if(r)
-    kmem.freelist = r->next;
-  release(&kmem.lock);
+    kmem[id].freelist = r->next;
+  release(&kmem[id].lock);
+
+  // 本地为空才向其他 CPU 借页，此时已释放本地锁。
+  if(r == 0){
+    for(int offset = 1; offset < NCPU; offset++){
+      int donor = (id + offset) % NCPU;
+      acquire(&kmem[donor].lock);
+      r = kmem[donor].freelist;
+      struct run *last = r;
+      if(r){
+        for(int count = 1; count < STEAL_BATCH && last->next; count++)
+          last = last->next;
+        // 在来源锁内整段摘下，防止同一页被再次分配。
+        kmem[donor].freelist = last->next;
+        last->next = 0;
+      }
+      release(&kmem[donor].lock);
+
+      if(r){
+        // 摘下的页已独占：第一张返回，其余挂回本地。
+        // 先放来源锁再拿本地锁，避免相互借页时死锁。
+        if(r->next){
+          acquire(&kmem[id].lock);
+          last->next = kmem[id].freelist;
+          kmem[id].freelist = r->next;
+          release(&kmem[id].lock);
+        }
+        break;
+      }
+    }
+  }
+  pop_off();
 
   if(r)
     memset((char*)r, 5, PGSIZE); // fill with junk
