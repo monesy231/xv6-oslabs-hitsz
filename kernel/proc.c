@@ -10,6 +10,11 @@ struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
 
+static char *procstate_names[] = {
+    [UNUSED] "unused", [SLEEPING] "sleep", [RUNNABLE] "runble",
+    [RUNNING] "run", [ZOMBIE] "zombie",
+};
+
 struct proc *initproc;
 
 int nextpid = 1;
@@ -271,6 +276,7 @@ int fork(void) {
 // Caller must hold p->lock.
 void reparent(struct proc *p) {
   struct proc *pp;
+  int child_num = 0;
 
   for (pp = proc; pp < &proc[NPROC]; pp++) {
     // this code uses pp->parent without holding pp->lock.
@@ -281,6 +287,9 @@ void reparent(struct proc *p) {
       // pp->parent can't change between the check and the acquire()
       // because only the parent changes it, and we're the parent.
       acquire(&pp->lock);
+      // Report the child before changing its parent to init.
+      exit_info("proc %d exit, child %d, pid %d, name %s, state %s\n",
+                p->pid, child_num++, pp->pid, pp->name, procstate_names[pp->state]);
       pp->parent = initproc;
       // we should wake up init here, but that would require
       // initproc->lock, which would be a deadlock, since we hold
@@ -322,21 +331,23 @@ void exit(int status) {
   wakeup1(initproc);
   release(&initproc->lock);
 
-  // grab a copy of p->parent, to ensure that we unlock the same
-  // parent we locked. in case our parent gives us away to init while
-  // we're waiting for the parent lock. we may then race with an
-  // exiting parent, but the result will be a harmless spurious wakeup
-  // to a dead or wrong process; proc structs are never re-allocated
-  // as anything else.
-  acquire(&p->lock);
-  struct proc *original_parent = p->parent;
-  release(&p->lock);
+  // Lock parent before child. Recheck in case we were reparented
+  // while waiting, so the diagnostic describes our actual parent.
+  struct proc *original_parent;
+  for (;;) {
+    acquire(&p->lock);
+    original_parent = p->parent;
+    release(&p->lock);
+    acquire(&original_parent->lock);
+    acquire(&p->lock);
+    if (p->parent == original_parent) break;
+    release(&p->lock);
+    release(&original_parent->lock);
+  }
 
-  // we need the parent's lock in order to wake it up from wait().
-  // the parent-then-child rule says we have to lock it first.
-  acquire(&original_parent->lock);
-
-  acquire(&p->lock);
+  exit_info("proc %d exit, parent pid %d, name %s, state %s\n",
+            p->pid, original_parent->pid, original_parent->name,
+            procstate_names[original_parent->state]);
 
   // Give any children to init.
   reparent(p);
@@ -356,7 +367,7 @@ void exit(int status) {
 
 // Wait for a child process to exit and return its pid.
 // Return -1 if this process has no children.
-int wait(uint64 addr) {
+int wait(uint64 addr, int flags) {
   struct proc *np;
   int havekids, pid;
   struct proc *p = myproc();
@@ -394,8 +405,8 @@ int wait(uint64 addr) {
       }
     }
 
-    // No point waiting if we don't have any children.
-    if (!havekids || p->killed) {
+    // Only return for nonblocking mode after looking for a zombie.
+    if (!havekids || p->killed || flags == 1) {
       release(&p->lock);
       return -1;
     }

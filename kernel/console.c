@@ -62,7 +62,9 @@ int consolewrite(int user_src, uint64 src, int n) {
   for (i = 0; i < n; i++) {
     char c;
     if (either_copyin(&c, user_src, src + i, 1) == -1) break;
-    uartputc(c);
+    // cons.lock disables interrupts: do not call uartputc(), which can
+    // sleep when its transmit buffer fills. Finish this write synchronously.
+    uartputc_sync(c);
   }
   release(&cons.lock);
 

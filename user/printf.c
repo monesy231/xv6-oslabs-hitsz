@@ -6,9 +6,30 @@
 
 static char digits[] = "0123456789ABCDEF";
 
-static void putc(int fd, char c) { write(fd, &c, 1); }
+// Keep short formatted messages in one write, instead of one write per byte.
+// Each call owns its buffer; long messages are emitted in bounded chunks.
+struct printbuf {
+  int fd;
+  int used;
+  char data[128];
+};
 
-static void printint(int fd, int xx, int base, int sgn) {
+static void flush(struct printbuf *out) {
+  int done = 0;
+  while (done < out->used) {
+    int n = write(out->fd, out->data + done, out->used - done);
+    if (n <= 0) break;
+    done += n;
+  }
+  out->used = 0;
+}
+
+static void putc(struct printbuf *out, char c) {
+  out->data[out->used++] = c;
+  if (out->used == sizeof(out->data)) flush(out);
+}
+
+static void printint(struct printbuf *out, int xx, int base, int sgn) {
   char buf[16];
   int i, neg;
   uint x;
@@ -27,18 +48,19 @@ static void printint(int fd, int xx, int base, int sgn) {
   } while ((x /= base) != 0);
   if (neg) buf[i++] = '-';
 
-  while (--i >= 0) putc(fd, buf[i]);
+  while (--i >= 0) putc(out, buf[i]);
 }
 
-static void printptr(int fd, uint64 x) {
+static void printptr(struct printbuf *out, uint64 x) {
   int i;
-  putc(fd, '0');
-  putc(fd, 'x');
-  for (i = 0; i < (sizeof(uint64) * 2); i++, x <<= 4) putc(fd, digits[x >> (sizeof(uint64) * 8 - 4)]);
+  putc(out, '0');
+  putc(out, 'x');
+  for (i = 0; i < (sizeof(uint64) * 2); i++, x <<= 4) putc(out, digits[x >> (sizeof(uint64) * 8 - 4)]);
 }
 
 // Print to the given fd. Only understands %d, %x, %p, %s.
 void vprintf(int fd, const char *fmt, va_list ap) {
+  struct printbuf out = { .fd = fd, .used = 0 };
   char *s;
   int c, i, state;
 
@@ -49,36 +71,38 @@ void vprintf(int fd, const char *fmt, va_list ap) {
       if (c == '%') {
         state = '%';
       } else {
-        putc(fd, c);
+        putc(&out, c);
       }
     } else if (state == '%') {
       if (c == 'd') {
-        printint(fd, va_arg(ap, int), 10, 1);
+        printint(&out, va_arg(ap, int), 10, 1);
       } else if (c == 'l') {
-        printint(fd, va_arg(ap, uint64), 10, 0);
+        printint(&out, va_arg(ap, uint64), 10, 0);
       } else if (c == 'x') {
-        printint(fd, va_arg(ap, int), 16, 0);
+        printint(&out, va_arg(ap, int), 16, 0);
       } else if (c == 'p') {
-        printptr(fd, va_arg(ap, uint64));
+        printptr(&out, va_arg(ap, uint64));
       } else if (c == 's') {
         s = va_arg(ap, char *);
         if (s == 0) s = "(null)";
         while (*s != 0) {
-          putc(fd, *s);
+          putc(&out, *s);
           s++;
         }
       } else if (c == 'c') {
-        putc(fd, va_arg(ap, uint));
+        putc(&out, va_arg(ap, uint));
       } else if (c == '%') {
-        putc(fd, c);
+        putc(&out, c);
       } else {
         // Unknown % sequence.  Print it to draw attention.
-        putc(fd, '%');
-        putc(fd, c);
+        putc(&out, '%');
+        putc(&out, c);
       }
       state = 0;
     }
   }
+  // Flush even without a newline, for prompts and partial messages.
+  flush(&out);
 }
 
 void fprintf(int fd, const char *fmt, ...) {
