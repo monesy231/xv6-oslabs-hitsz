@@ -12,13 +12,13 @@ find(char *path, char *name)
   struct dirent de;
   struct stat st;
 
-  // 打开当前路径
+  // 只读打开当前路径，失败时结束本层查找。
   if ((fd = open(path, 0)) < 0) {
     fprintf(2, "find: cannot open %s\n", path);
     return;
   }
 
-  // 获取当前路径的信息
+  // fstat 判断当前路径是文件还是目录。
   if (fstat(fd, &st) < 0) {
     fprintf(2, "find: cannot stat %s\n", path);
     close(fd);
@@ -28,52 +28,49 @@ find(char *path, char *name)
   switch (st.type) {
 
   case T_FILE:
-    // 如果传进来的 path 本身是普通文件，这里不需要继续递归
+    // 普通文件不再向下遍历。
     break;
 
   case T_DIR:
-    // 防止拼接后的路径超过 buf 大小
+    // 为斜杠、目录项名字和字符串结束符留够空间。
     if (strlen(path) + 1 + DIRSIZ + 1 > sizeof(buf)) {
       printf("find: path too long\n");
       break;
     }
 
-    // 复制当前路径
+    // 拼接子项路径，p 指向文件名的位置。
     strcpy(buf, path);
 
-    // p 指向路径末尾
     p = buf + strlen(buf);
 
-    // 后面准备拼接 "/文件名"
     *p++ = '/';
 
-    // 不断读取目录项
+    // 每次读取一个完整目录项，读不到时结束遍历。
     while (read(fd, &de, sizeof(de)) == sizeof(de)) {
 
-      // 无效目录项
+      // inum 为 0 表示空目录项。
       if (de.inum == 0)
         continue;
 
-      // 把目录项名字拼到路径后面
+      // 目录项名字可能没有结束符，复制后手动补 0。
       memmove(p, de.name, DIRSIZ);
       p[DIRSIZ] = 0;
 
-      // 一定要跳过 . 和 ..
+      // 跳过自身和父目录，避免无限递归。
       if (strcmp(p, ".") == 0 || strcmp(p, "..") == 0)
         continue;
 
-      // 如果名字匹配，打印完整路径
+      // 文件和目录都匹配；同名目录只在这里输出一次。
       if (strcmp(p, name) == 0) {
         printf("%s\n", buf);
       }
 
-      // 获取这个目录项的信息
       if (stat(buf, &st) < 0) {
         printf("find: cannot stat %s\n", buf);
         continue;
       }
 
-      // 如果它还是一个目录，就递归进去
+      // 递归只检查子项，不重复输出当前目录。
       if (st.type == T_DIR) {
         find(buf, name);
       }
@@ -82,12 +79,14 @@ find(char *path, char *name)
     break;
   }
 
+  // 关闭本层打开的描述符，避免递归时耗尽资源。
   close(fd);
 }
 
 int
 main(int argc, char *argv[])
 {
+  // argv[1] 是起始目录，argv[2] 是要查找的名字。
   if (argc != 3) {
     fprintf(2, "usage: find <path> <name>\n");
     exit(1);
