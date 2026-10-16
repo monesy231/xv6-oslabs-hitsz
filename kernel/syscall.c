@@ -89,6 +89,7 @@ extern uint64 sys_wait(void);
 extern uint64 sys_write(void);
 extern uint64 sys_uptime(void);
 extern uint64 sys_rename(void);
+// 声明 yield 的内核入口，并在下方 syscalls[] 中登记。
 extern uint64 sys_yield(void);
 
 static uint64 (*syscalls[])(void) = {

@@ -108,7 +108,7 @@ void            sched(void);
 void            setproc(struct proc*);
 void            sleep(void*, struct spinlock*);
 void            userinit(void);
-int             wait(uint64, int);
+int             wait(uint64, int);  // flags：0 阻塞，1 非阻塞。
 void            wakeup(void*);
 void            yield(void);
 int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);

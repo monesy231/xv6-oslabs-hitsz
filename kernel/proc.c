@@ -10,6 +10,7 @@ struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
 
+// 状态名按题目输出为小写，runble 是规定拼写。
 static char *procstate_names[] = {
     [UNUSED] "unused", [SLEEPING] "sleep", [RUNNABLE] "runble",
     [RUNNING] "run", [ZOMBIE] "zombie",
@@ -276,7 +277,7 @@ int fork(void) {
 // Caller must hold p->lock.
 void reparent(struct proc *p) {
   struct proc *pp;
-  int child_num = 0;
+  int child_num = 0;  // 子进程序号从 0 开始，不是 PID。
 
   for (pp = proc; pp < &proc[NPROC]; pp++) {
     // this code uses pp->parent without holding pp->lock.
@@ -287,7 +288,7 @@ void reparent(struct proc *p) {
       // pp->parent can't change between the check and the acquire()
       // because only the parent changes it, and we're the parent.
       acquire(&pp->lock);
-      // Report the child before changing its parent to init.
+      // 先输出子进程信息，再把它交给 init。
       exit_info("proc %d exit, child %d, pid %d, name %s, state %s\n",
                 p->pid, child_num++, pp->pid, pp->name, procstate_names[pp->state]);
       pp->parent = initproc;
@@ -331,8 +332,7 @@ void exit(int status) {
   wakeup1(initproc);
   release(&initproc->lock);
 
-  // Lock parent before child. Recheck in case we were reparented
-  // while waiting, so the diagnostic describes our actual parent.
+  // 按父到子的顺序持锁；父指针若在等待期间变了，就重试。
   struct proc *original_parent;
   for (;;) {
     acquire(&p->lock);
@@ -345,6 +345,7 @@ void exit(int status) {
     release(&original_parent->lock);
   }
 
+  // 退出信息必须用 exit_info，不能直接用 printf。
   exit_info("proc %d exit, parent pid %d, name %s, state %s\n",
             p->pid, original_parent->pid, original_parent->name,
             procstate_names[original_parent->state]);
@@ -405,13 +406,13 @@ int wait(uint64 addr, int flags) {
       }
     }
 
-    // Only return for nonblocking mode after looking for a zombie.
+    // 先尝试回收僵尸子进程；flags 为 1 时不再睡眠。
     if (!havekids || p->killed || flags == 1) {
       release(&p->lock);
       return -1;
     }
 
-    // Wait for a child to exit.
+    // 阻塞模式睡眠等待，醒来后重新扫描子进程。
     sleep(p, &p->lock);  // DOC: wait-sleep
   }
 }
