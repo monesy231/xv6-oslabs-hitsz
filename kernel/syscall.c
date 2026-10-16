@@ -89,7 +89,7 @@ extern uint64 sys_wait(void);
 extern uint64 sys_write(void);
 extern uint64 sys_uptime(void);
 extern uint64 sys_rename(void);
-// 声明 yield 的内核入口，并在下方 syscalls[] 中登记。
+// sys_yield 是系统调用入口，实现在 sysproc.c 中。
 extern uint64 sys_yield(void);
 
 static uint64 (*syscalls[])(void) = {
@@ -98,6 +98,7 @@ static uint64 (*syscalls[])(void) = {
     [SYS_chdir] sys_chdir, [SYS_dup] sys_dup,       [SYS_getpid] sys_getpid, [SYS_sbrk] sys_sbrk,
     [SYS_sleep] sys_sleep, [SYS_uptime] sys_uptime, [SYS_open] sys_open,     [SYS_write] sys_write,
     [SYS_mknod] sys_mknod, [SYS_unlink] sys_unlink, [SYS_link] sys_link,     [SYS_mkdir] sys_mkdir,
+    // 用 SYS_yield 作为下标，将调用分发到 sys_yield。
     [SYS_close] sys_close, [SYS_rename] sys_rename, [SYS_yield] sys_yield,
 };
 

@@ -62,8 +62,8 @@ int consolewrite(int user_src, uint64 src, int n) {
   for (i = 0; i < n; i++) {
     char c;
     if (either_copyin(&c, user_src, src + i, 1) == -1) break;
-    // cons.lock disables interrupts: do not call uartputc(), which can
-    // sleep when its transmit buffer fills. Finish this write synchronously.
+    // 持有 cons.lock 时不能睡眠，改用同步发送。
+    // 原 uartputc 在发送缓冲区满时会 sleep。
     uartputc_sync(c);
   }
   release(&cons.lock);

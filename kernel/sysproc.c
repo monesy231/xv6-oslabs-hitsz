@@ -7,6 +7,7 @@
 #include "spinlock.h"
 #include "proc.h"
 
+// 复用 proc.c 的进程表，扫描下一个就绪进程。
 extern struct proc proc[NPROC];
 
 uint64 sys_exit(void) {
@@ -92,7 +93,7 @@ uint64 sys_yield(void) {
   // 没有其他就绪进程时，当前进程仍可再次被调度。
   int next_pid = p->pid;
   uint64 next_pc = p->trapframe->epc;
-  int current = p - proc;
+  int current = p - proc;  // 指针相减得到当前进程在表中的下标。
 
   // 关本核中断，保证单核观察稳定；其他核仍可能调度候选进程。
   push_off();
@@ -103,6 +104,7 @@ uint64 sys_yield(void) {
     if (next->state == RUNNABLE) {
       next_pid = next->pid;
       next_pc = next->trapframe->epc;
+      // 只保存候选信息，离开循环前就释放锁。
       release(&next->lock);
       break;
     }
@@ -112,13 +114,14 @@ uint64 sys_yield(void) {
   // context 区间左闭右开，共 112 字节；指针加 1 跨过整个结构体。
   printf("Save the context of the process to the memory region from address %p to %p\n",
          (uint64)&p->context, (uint64)(&p->context + 1));
-  // 用户态 PC 取 trapframe->epc，不是内核 context 中的 ra。
+  // 用户态返回位置取 trapframe->epc，已跳过 ecall；不能用 context.ra。
   printf("Current running process pid is %d and user pc is %p\n",
          p->pid, p->trapframe->epc);
   printf("Next runnable process pid is %d and user pc is %p\n", next_pid, next_pc);
   // 先平衡额外的 push_off，再让 yield 持进程锁进入 sched。
   pop_off();
 
+  // 变为 RUNNABLE 并进入调度器，被再次选中后从这里继续。
   yield();
   return 0;
 }

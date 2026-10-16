@@ -337,6 +337,7 @@ void exit(int status) {
   for (;;) {
     acquire(&p->lock);
     original_parent = p->parent;
+    // 先放开自己的锁，再等父锁，避免父子互相等待。
     release(&p->lock);
     acquire(&original_parent->lock);
     acquire(&p->lock);
@@ -389,14 +390,17 @@ int wait(uint64 addr, int flags) {
         // because only the parent changes it, and we're the parent.
         acquire(&np->lock);
         havekids = 1;
+        // 非阻塞等待也要回收僵尸进程，不能一进来就返回。
         if (np->state == ZOMBIE) {
           // Found one.
           pid = np->pid;
+          // 用 copyout 向用户地址写回退出状态；addr 为 0 时不写回。
           if (addr != 0 && copyout(p->pagetable, addr, (char *)&np->xstate, sizeof(np->xstate)) < 0) {
             release(&np->lock);
             release(&p->lock);
             return -1;
           }
+          // 回收资源并归还进程槽，成功时返回子进程 PID。
           freeproc(np);
           release(&np->lock);
           release(&p->lock);
@@ -406,13 +410,15 @@ int wait(uint64 addr, int flags) {
       }
     }
 
-    // 先尝试回收僵尸子进程；flags 为 1 时不再睡眠。
+    // No point waiting if we don't have any children.
+    // 已先尝试回收；flags 为 1 时不再睡眠。
     if (!havekids || p->killed || flags == 1) {
       release(&p->lock);
       return -1;
     }
 
-    // 阻塞模式睡眠等待，醒来后重新扫描子进程。
+    // Wait for a child to exit.
+    // 唤醒后重新扫描，检查是否已有子进程退出。
     sleep(p, &p->lock);  // DOC: wait-sleep
   }
 }

@@ -6,8 +6,8 @@
 
 static char digits[] = "0123456789ABCDEF";
 
-// Keep short formatted messages in one write, instead of one write per byte.
-// Each call owns its buffer; long messages are emitted in bounded chunks.
+// 每次调用使用独立缓冲，短消息尽量一次写完，减少字符交错。
+// 超过 128 字节就分段输出，不保证长消息整体连续。
 struct printbuf {
   int fd;
   int used;
@@ -16,6 +16,7 @@ struct printbuf {
 
 static void flush(struct printbuf *out) {
   int done = 0;
+  // write 可能只写出一部分，继续发送剩余内容。
   while (done < out->used) {
     int n = write(out->fd, out->data + done, out->used - done);
     if (n <= 0) break;
@@ -101,7 +102,7 @@ void vprintf(int fd, const char *fmt, va_list ap) {
       state = 0;
     }
   }
-  // Flush even without a newline, for prompts and partial messages.
+  // 没有换行也要刷新，保证提示符能及时显示。
   flush(&out);
 }
 
