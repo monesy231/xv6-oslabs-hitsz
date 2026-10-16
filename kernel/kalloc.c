@@ -31,6 +31,7 @@ struct {
 void
 kinit()
 {
+  // kmem 前缀供 kalloctest 汇总锁争用次数。
   for(int i = 0; i < NCPU; i++)
     initlock(&kmem[i].lock, "kmem");
   freerange(end, (void*)PHYSTOP);
@@ -40,6 +41,7 @@ kinit()
   push_off();
   int id = cpuid();
   struct run *r = kmem[id].freelist;
+  // 先取下整条链表再分散，避免页面同时挂在两条链表上。
   kmem[id].freelist = 0;
   for(int target = 0; r; target = (target + 1) % NCPU){
     struct run *next = r->next;
@@ -106,6 +108,7 @@ kalloc(void)
 
   // 本地为空才向其他 CPU 借页，此时已释放本地锁。
   if(r == 0){
+    // 所有其他链表都要检查，未启用 CPU 的空闲页也能借用。
     for(int offset = 1; offset < NCPU; offset++){
       int donor = (id + offset) % NCPU;
       acquire(&kmem[donor].lock);
@@ -133,6 +136,7 @@ kalloc(void)
       }
     }
   }
+  // 取页和借页都结束后再恢复中断状态，保证途中 CPU 编号不变。
   pop_off();
 
   if(r)

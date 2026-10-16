@@ -1,8 +1,7 @@
 // Buffer cache.
 //
-// The buffer cache uses hash buckets to hold cached copies of disk
-// block contents. Caching disk blocks in memory reduces disk reads
-// and provides a synchronization point for shared disk blocks.
+// 使用哈希桶缓存磁盘块，减少重复读盘。
+// 同一磁盘块由各进程共享一份缓存，并通过锁协调访问。
 //
 // Interface:
 // * To get a buffer for a particular disk block, call bread.
@@ -93,6 +92,7 @@ brecycle(void)
   struct buf *b;
   struct bucket *bucket;
 
+  // 优先用尚未分配的块，避免扫描和迁移已有缓存。
   if(bcache.free){
     b = bcache.free;
     bcache.free = b->next;
@@ -101,6 +101,7 @@ brecycle(void)
   }
 
   // evict 保证块身份不变，桶锁保护引用计数；按环形游标找空闲块。
+  // 不维护全局 LRU，省去每次释放时移动链表的开销。
   for(int i = 0; i < NBUF; i++){
     b = &bcache.buf[bcache.cursor];
     bcache.cursor = (bcache.cursor + 1) % NBUF;
@@ -152,7 +153,8 @@ bget(uint dev, uint blockno)
     return b;
   }
 
-  // 等待 evict 时可能已有其他 CPU 插入该块，重查以避免重复副本。
+  // 必须先放桶锁再等 evict，避免反向加锁。
+  // 等待期间可能已有其他 CPU 插入该块，重查以避免重复副本。
   acquire(&bcache.evict);
   acquire(&bucket->lock);
   b = blookup(bucket, dev, blockno);
@@ -164,6 +166,7 @@ bget(uint dev, uint blockno)
   }
 
   b = brecycle();
+  // 回收时已放开来源桶锁，再拿目标桶锁，不同时占用两个桶。
   acquire(&bucket->lock);
   b->dev = dev;
   b->blockno = blockno;
@@ -215,6 +218,7 @@ brelse(struct buf *b)
 
   releasesleep(&b->lock);
 
+  // 引用归零仅表示可回收，数据仍保留在缓存中供下次命中。
   acquire(&bucket->lock);
   b->refcnt--;
   release(&bucket->lock);
