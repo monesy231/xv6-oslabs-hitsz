@@ -101,6 +101,7 @@ found:
 
   // Allocate a trapframe page.
   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
+    // 创建失败也要清理进程状态，便于槽位再次使用。
     freeproc(p);
     release(&p->lock);
     return 0;
@@ -138,6 +139,7 @@ found:
 static void freeproc(struct proc *p) {
   // 先断开共享引用，再由用户页表回收用户内存和 L0 表。
   if (p->k_pagetable) kvmfree(p->k_pagetable);
+  // 清空指针，避免槽位复用时留下悬空引用。
   p->k_pagetable = 0;
   if (p->trapframe) kfree((void *)p->trapframe);
   p->trapframe = 0;
@@ -230,6 +232,7 @@ int growproc(int n) {
 
   sz = p->sz;
   if (n > 0) {
+    // 用剩余空间检查增长量，避免加法溢出或越过 PLIC。
     if (sz > PLIC || (uint64)n > PLIC - sz) return -1;
     if ((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
       return -1;
@@ -237,6 +240,7 @@ int growproc(int n) {
   } else if (n < 0) {
     // 先扩成 long 再取负，避免 n 为 INT_MIN 时溢出。
     uint64 shrink = -(long)n;
+    // 回收量不能超过现有大小，防止无符号减法下溢。
     if (shrink > sz) return -1;
     sz = uvmdealloc(p->pagetable, sz, sz - shrink);
   }

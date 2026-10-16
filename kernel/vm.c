@@ -59,6 +59,7 @@ static void vmprint_level(pagetable_t pagetable, int level, uint64 prefix) {
     if (pte & PTE_W) flags[1] = 'w';
     if (pte & PTE_X) flags[2] = 'x';
     if (pte & PTE_U) flags[3] = 'u';
+    // 每下降一级多缩进一层，与指导书的树形输出对应。
     for (int depth = 2; depth > level; depth--) printf("||   ");
     printf("||idx: %d: ", i);
     // 有 R/W/X 权限的是叶子项，否则继续下探。
@@ -71,6 +72,7 @@ static void vmprint_level(pagetable_t pagetable, int level, uint64 prefix) {
   }
 }
 
+// 先打印根表地址，再从最高层 L2 开始遍历。
 void vmprint(pagetable_t pagetable) {
   printf("page table %p\n", pagetable);
   vmprint_level(pagetable, 2, 0);
@@ -84,11 +86,13 @@ static void kvmfreewalk(pagetable_t pagetable) {
       kvmfreewalk((pagetable_t)PTE2PA(pte));
     pagetable[i] = 0;
   }
+  // 子页表处理完后，再释放当前页表页。
   kfree((void *)pagetable);
 }
 
 // 先断开共享 L0 表的引用，避免随内核页表重复释放。
 void kvmfree(pagetable_t pagetable) {
+  // 用户区位于根表第 0 项，只清除 PLIC 以下的引用。
   if (pagetable[0] & PTE_V) {
     pagetable_t l1 = (pagetable_t)PTE2PA(pagetable[0]);
     for (int i = 0; i < PX(1, PLIC); i++) l1[i] = 0;
@@ -100,6 +104,7 @@ void kvmfree(pagetable_t pagetable) {
 pagetable_t kvmcreate(void) {
   pagetable_t pagetable = uvmcreate();
   if (pagetable == 0) return 0;
+  // 沿用设备、内核和 trampoline 映射，内核栈由 allocproc 单独补齐。
   if (mappages(pagetable, UART0, PGSIZE, UART0, PTE_R | PTE_W) < 0 ||
       mappages(pagetable, VIRTIO0, PGSIZE, VIRTIO0, PTE_R | PTE_W) < 0 ||
       mappages(pagetable, PLIC, 0x400000, PLIC, PTE_R | PTE_W) < 0 ||
@@ -108,18 +113,22 @@ pagetable_t kvmcreate(void) {
       mappages(pagetable, (uint64)etext, PHYSTOP - (uint64)etext, (uint64)etext,
                PTE_R | PTE_W) < 0 ||
       mappages(pagetable, TRAMPOLINE, PGSIZE, (uint64)trampoline, PTE_R | PTE_X) < 0) {
+    // 任一映射失败，都要回收已经分配的页表页。
     kvmfree(pagetable);
     return 0;
   }
   return pagetable;
 }
 
-// 设备映射已建好内核 L1 表，这里无需分配。
-// 192 MiB / 2 MiB = 96：共享 L0 表，空项也要同步以清除旧引用。
+// 两张 L1 表各自独立，复制目录项后指向同一组用户 L0 表。
+// 共享叶子 PTE 的 U 位保持不变，内核读取时临时开启 SUM。
 void sync_pagetable(pagetable_t user, pagetable_t kernel) {
+  // 设备映射已建好内核 L1 表，这里无需分配。
   pagetable_t dst = (pagetable_t)PTE2PA(kernel[0]);
   pagetable_t src = (user[0] & PTE_V) ? (pagetable_t)PTE2PA(user[0]) : 0;
+  // 192 MiB / 2 MiB = 96；空项也要同步，清除旧用户页表的引用。
   for (int i = 0; i < PX(1, PLIC); i++) dst[i] = src ? src[i] : 0;
+  // 刷新当前 CPU 的 TLB，使后续访存使用新映射。
   sfence_vma();
 }
 
@@ -397,11 +406,14 @@ int copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len) {
 static uint64 user_readable(pagetable_t pagetable, uint64 va, uint64 len) {
   uint64 done = 0;
   if (va >= PLIC) return 0;
+  // 用减法限制读取范围，避免 va + len 溢出。
   if (len > PLIC - va) len = PLIC - va;
   while (done < len) {
     pte_t *pte = walk(pagetable, va + done, 0);
+    // 保护页只清 U 位，S 态仍能访问，因此必须额外检查用户权限。
     int perm = PTE_V | PTE_U | PTE_R;
     if (pte == 0 || (*pte & perm) != perm) break;
+    // 每次检查到当前页末，跨页后重新验证权限。
     uint64 n = PGSIZE - ((va + done) % PGSIZE);
     if (n > len - done) n = len - done;
     done += n;
@@ -409,6 +421,9 @@ static uint64 user_readable(pagetable_t pagetable, uint64 va, uint64 len) {
   return done;
 }
 
+// Copy from user to kernel.
+// Copy len bytes to dst from virtual address srcva in a given page table.
+// Return 0 on success, -1 on error.
 // 定长拷贝要求整段可读，不能借内核映射绕过用户保护页。
 int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
   if (user_readable(pagetable, srcva, len) != len) return -1;
@@ -423,9 +438,14 @@ int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
   return result;
 }
 
+// Copy a null-terminated string from user to kernel.
+// Copy bytes to dst from virtual address srcva in a given page table,
+// until a '\0', or max.
+// Return 0 on success, -1 on error.
 // 缩短读取上限，保留保护页前的合法字符串；新函数仍只调用一次。
 int copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max) {
   max = user_readable(pagetable, srcva, max);
+  // 与 copyin 一样，关中断后临时开启 SUM，拷贝完恢复原状态。
   push_off();
   uint64 sum = r_sstatus() & SSTATUS_SUM;
   w_sstatus(r_sstatus() | SSTATUS_SUM);
