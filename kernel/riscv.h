@@ -40,7 +40,7 @@ w_mepc(uint64 x)
 
 // Supervisor Status Register, sstatus
 
-#define SSTATUS_SUM (1L << 18) // Permit supervisor access to user pages
+#define SSTATUS_SUM (1L << 18) // 允许 S 态读写 U=1 的页面
 #define SSTATUS_SPP (1L << 8)  // Previous mode, 1=Supervisor, 0=User
 #define SSTATUS_SPIE (1L << 5) // Supervisor Previous Interrupt Enable
 #define SSTATUS_UPIE (1L << 4) // User Previous Interrupt Enable

@@ -158,6 +158,7 @@ void            uartputc_sync(int);
 int             uartgetc(void);
 
 // vm.c
+// Lab4：页表打印、私有内核页表和用户映射同步。
 void            vmprint(pagetable_t);
 pagetable_t     kvmcreate(void);
 void            kvmfree(pagetable_t);

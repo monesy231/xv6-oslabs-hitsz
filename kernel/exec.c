@@ -95,9 +95,11 @@ int exec(char *path, char **argv) {
   p->sz = sz;
   p->trapframe->epc = elf.entry;  // initial program counter = main
   p->trapframe->sp = sp;          // initial stack pointer
+  // 先换掉内核表中的旧引用，再释放旧用户页表。
   sync_pagetable(p->pagetable, p->k_pagetable);
   proc_freepagetable(oldpagetable, oldsz);
 
+  // 只打印 init 的页表，便于核对层级和权限。
   if (p->pid == 1) vmprint(p->pagetable);
   return argc;  // this ends up in a0, the first argument to main(argc, argv)
 

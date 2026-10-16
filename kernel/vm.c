@@ -45,13 +45,15 @@ void kvminit() {
   kvmmap(TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
 }
 
-// Print valid entries, carrying the virtual-address prefix down the tree.
+// 从 L2 递归到 L0，只打印有效项。
 static void vmprint_level(pagetable_t pagetable, int level, uint64 prefix) {
   for (int i = 0; i < 512; i++) {
     pte_t pte = pagetable[i];
     if ((pte & PTE_V) == 0) continue;
+    // 每级索引占 9 位，拼接时保留上层地址。
     uint64 va = prefix | ((uint64)i << PXSHIFT(level));
     uint64 pa = PTE2PA(pte);
+    // 内核 printf 不支持 %c，用字符串输出 rwxu 权限。
     char flags[] = "----";
     if (pte & PTE_R) flags[0] = 'r';
     if (pte & PTE_W) flags[1] = 'w';
@@ -59,6 +61,7 @@ static void vmprint_level(pagetable_t pagetable, int level, uint64 prefix) {
     if (pte & PTE_U) flags[3] = 'u';
     for (int depth = 2; depth > level; depth--) printf("||   ");
     printf("||idx: %d: ", i);
+    // 有 R/W/X 权限的是叶子项，否则继续下探。
     if (pte & (PTE_R | PTE_W | PTE_X)) {
       printf("va: %p -> pa: %p, flags: %s\n", va, pa, flags);
     } else {
@@ -73,7 +76,7 @@ void vmprint(pagetable_t pagetable) {
   vmprint_level(pagetable, 2, 0);
 }
 
-// Free only page-table pages; mapped memory belongs to other owners.
+// 只释放页表页，不释放叶子映射指向的物理页。
 static void kvmfreewalk(pagetable_t pagetable) {
   for (int i = 0; i < 512; i++) {
     pte_t pte = pagetable[i];
@@ -84,7 +87,7 @@ static void kvmfreewalk(pagetable_t pagetable) {
   kfree((void *)pagetable);
 }
 
-// The low 96 L1 entries borrow L0 tables owned by the user page table.
+// 先断开共享 L0 表的引用，避免随内核页表重复释放。
 void kvmfree(pagetable_t pagetable) {
   if (pagetable[0] & PTE_V) {
     pagetable_t l1 = (pagetable_t)PTE2PA(pagetable[0]);
@@ -93,7 +96,7 @@ void kvmfree(pagetable_t pagetable) {
   kvmfreewalk(pagetable);
 }
 
-// Per-process kernel mappings. CLINT stays in the global table only.
+// 新建私有内核页表；省去 CLINT 映射，给用户低地址区留空间。
 pagetable_t kvmcreate(void) {
   pagetable_t pagetable = uvmcreate();
   if (pagetable == 0) return 0;
@@ -111,8 +114,8 @@ pagetable_t kvmcreate(void) {
   return pagetable;
 }
 
-// Device mappings ensure the private table already has its low L1 page.
-// Replace all borrowed entries, including absent ones after exec/shrink.
+// 设备映射已建好内核 L1 表，这里无需分配。
+// 192 MiB / 2 MiB = 96：共享 L0 表，空项也要同步以清除旧引用。
 void sync_pagetable(pagetable_t user, pagetable_t kernel) {
   pagetable_t dst = (pagetable_t)PTE2PA(kernel[0]);
   pagetable_t src = (user[0] & PTE_V) ? (pagetable_t)PTE2PA(user[0]) : 0;
@@ -266,6 +269,7 @@ uint64 uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz) {
   char *mem;
   uint64 a;
 
+  // 用户地址不能进入 PLIC 设备映射区。
   if (newsz > PLIC) return 0;
   if (newsz < oldsz) return oldsz;
 
@@ -388,8 +392,8 @@ int copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len) {
   return 0;
 }
 
-// Find the readable user prefix without translating the data address to PA.
-// Limit strings at the first inaccessible page, so an earlier NUL still works.
+// 遍历页表检查 V/U/R 权限，实际拷贝仍用硬件地址翻译。
+// 返回连续可读长度，允许字符串在保护页前正常结束。
 static uint64 user_readable(pagetable_t pagetable, uint64 va, uint64 len) {
   uint64 done = 0;
   if (va >= PLIC) return 0;
@@ -405,21 +409,21 @@ static uint64 user_readable(pagetable_t pagetable, uint64 va, uint64 len) {
   return done;
 }
 
-// Copy from user to kernel.
-// Copy len bytes to dst from virtual address srcva in a given page table.
-// Return 0 on success, -1 on error.
+// 定长拷贝要求整段可读，不能借内核映射绕过用户保护页。
 int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
   if (user_readable(pagetable, srcva, len) != len) return -1;
+  // 避免 SUM 开启期间发生进程切换。
   push_off();
   uint64 sum = r_sstatus() & SSTATUS_SUM;
   w_sstatus(r_sstatus() | SSTATUS_SUM);
   int result = copyin_new(pagetable, dst, srcva, len);
+  // 恢复原 SUM 状态，不一直开放用户页访问。
   w_sstatus((r_sstatus() & ~SSTATUS_SUM) | sum);
   pop_off();
   return result;
 }
 
-// Copy a user string with hardware translation through the shared mappings.
+// 缩短读取上限，保留保护页前的合法字符串；新函数仍只调用一次。
 int copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max) {
   max = user_readable(pagetable, srcva, max);
   push_off();

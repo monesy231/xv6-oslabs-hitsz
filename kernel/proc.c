@@ -37,6 +37,7 @@ void procinit(void) {
     uint64 va = KSTACK((int)(p - proc));
     kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
     p->kstack = va;
+    // 栈页按进程槽位长期复用，退出时不释放。
     p->kstack_pa = (uint64)pa;
   }
   kvminithart();
@@ -113,7 +114,7 @@ found:
     return 0;
   }
 
-  // Map this slot's permanent kernel stack in the private page table.
+  // 私有页表也要映射本进程的栈，否则切表后无法继续执行。
   p->k_pagetable = kvmcreate();
   if (p->k_pagetable == 0 ||
       mappages(p->k_pagetable, p->kstack, PGSIZE, p->kstack_pa, PTE_R | PTE_W) < 0) {
@@ -135,7 +136,7 @@ found:
 // including user pages.
 // p->lock must be held.
 static void freeproc(struct proc *p) {
-  // Detach shared user page tables before freeing their owner below.
+  // 先断开共享引用，再由用户页表回收用户内存和 L0 表。
   if (p->k_pagetable) kvmfree(p->k_pagetable);
   p->k_pagetable = 0;
   if (p->trapframe) kfree((void *)p->trapframe);
@@ -206,6 +207,7 @@ void userinit(void) {
   // and data into it.
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
+  // 第一个进程也要同步，供首次 exec 读取用户参数。
   sync_pagetable(p->pagetable, p->k_pagetable);
 
   // prepare for the very first "return" from kernel to user.
@@ -233,11 +235,13 @@ int growproc(int n) {
       return -1;
     }
   } else if (n < 0) {
+    // 先扩成 long 再取负，避免 n 为 INT_MIN 时溢出。
     uint64 shrink = -(long)n;
     if (shrink > sz) return -1;
     sz = uvmdealloc(p->pagetable, sz, sz - shrink);
   }
   p->sz = sz;
+  // 扩容、缩容都要同步并刷新 TLB。
   sync_pagetable(p->pagetable, p->k_pagetable);
   return 0;
 }
@@ -261,6 +265,7 @@ int fork(void) {
     return -1;
   }
   np->sz = p->sz;
+  // 同步的是子进程页表，不能误用父进程的映射。
   sync_pagetable(np->pagetable, np->k_pagetable);
 
   np->parent = p;
@@ -450,9 +455,11 @@ void scheduler(void) {
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        // 先切私有页表并刷新 TLB，再切进程上下文。
         w_satp(MAKE_SATP(p->k_pagetable));
         sfence_vma();
         swtch(&c->context, &p->context);
+        // 回到调度器后恢复全局内核页表。
         kvminithart();
 
         // Process is done running for now.
