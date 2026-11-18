@@ -38,7 +38,16 @@ make qemu
 
 ## AI 访问负载附加题
 
-附加题用 xv6 用户程序模拟模型分片、embedding 和 KV cache 的文件访问。在 xv6 shell 中先执行 `modelprep` 生成测试数据，再执行 `aiinfer baseline -w 3 -r 24` 运行基线。宿主机上的 `make grade-ai` 单独运行[附加题评分](grade-ai)。
+附加题用 xv6 用户程序模拟模型分片、embedding 和 KV cache 的文件访问。手工运行基线时使用新建的 `fs.img`，因为必做测试后的镜像可能没有足够的空闲 inode。若要重建，在退出 QEMU 并保存镜像内需要保留的数据后，执行 `make clean && make qemu`。
+
+在 xv6 shell 中运行以下命令。
+
+```text
+modelprep
+aiinfer baseline -w 3 -r 24
+```
+
+宿主机上的 `make grade-ai` 会清理旧镜像并运行[附加题评分](grade-ai)。
 
 仓库提供基线实现和测试框架。学生侧的[模型与 embedding 加载](user/ai_student_model.c)、[KV 持久化与恢复](user/ai_student_kv.c)和[异步预取](user/ai_student_prefetch.c)仍有待实现。
 
