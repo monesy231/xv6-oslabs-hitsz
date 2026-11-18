@@ -1,0 +1,420 @@
+diff --git a/kernel/bio.c b/kernel/bio.c
+index 60d91a6..ca80317 100644
+--- a/kernel/bio.c
++++ b/kernel/bio.c
+@@ -1,9 +1,7 @@
+ // Buffer cache.
+ //
+-// The buffer cache is a linked list of buf structures holding
+-// cached copies of disk block contents.  Caching disk blocks
+-// in memory reduces the number of disk reads and also provides
+-// a synchronization point for disk blocks used by multiple processes.
++// 使用哈希桶缓存磁盘块，减少重复读盘。
++// 同一磁盘块由各进程共享一份缓存，并通过锁协调访问。
+ //
+ // Interface:
+ // * To get a buffer for a particular disk block, call bread.
+@@ -13,7 +11,6 @@
+ // * Only one process at a time can use a buffer,
+ //     so do not keep them longer than necessary.
+ 
+-
+ #include "types.h"
+ #include "param.h"
+ #include "spinlock.h"
+@@ -23,14 +20,24 @@
+ #include "fs.h"
+ #include "buf.h"
+ 
+-struct {
++// 按块号分到 31 个桶以减少冲突，缓冲块总数仍为 NBUF。
++#define NBUCKETS 31
++
++struct bucket {
++  // 保护桶内链表、块身份和引用计数；块内容由睡眠锁保护。
+   struct spinlock lock;
++  struct buf *head;
++};
++
++struct {
++  struct bucket bucket[NBUCKETS];
+   struct buf buf[NBUF];
+ 
+-  // Linked list of all buffers, through prev/next.
+-  // Sorted by how recently the buffer was used.
+-  // head.next is most recent, head.prev is least.
+-  struct buf head;
++  // 仅未命中时拿 evict，保护空闲池、游标及块身份的更换。
++  // 加锁顺序：先 evict，再桶锁；需要全部桶时按编号递增。
++  struct spinlock evict;
++  struct buf *free;
++  uint cursor;
+ } bcache;
+ 
+ void
+@@ -38,56 +45,145 @@ binit(void)
+ {
+   struct buf *b;
+ 
+-  initlock(&bcache.lock, "bcache");
++  initlock(&bcache.evict, "bcache.evict");
++  for(int i = 0; i < NBUCKETS; i++)
++    initlock(&bcache.bucket[i].lock, "bcache.bucket");
+ 
+-  // Create linked list of buffers
+-  bcache.head.prev = &bcache.head;
+-  bcache.head.next = &bcache.head;
++  // 尚未分配的块放在独立空闲池，避免初始的 (0, 0) 被误判为命中。
+   for(b = bcache.buf; b < bcache.buf+NBUF; b++){
+-    b->next = bcache.head.next;
+-    b->prev = &bcache.head;
+     initsleeplock(&b->lock, "buffer");
+-    bcache.head.next->prev = b;
+-    bcache.head.next = b;
++    b->next = bcache.free;
++    bcache.free = b;
+   }
+ }
+ 
+-// Look through buffer cache for block on device dev.
+-// If not found, allocate a buffer.
+-// In either case, return locked buffer.
++// 调用者持有桶锁；匹配设备号和块号后增加引用，防止等待期间被回收。
+ static struct buf*
+-bget(uint dev, uint blockno)
++blookup(struct bucket *bucket, uint dev, uint blockno)
+ {
+   struct buf *b;
+ 
+-  acquire(&bcache.lock);
+-
+-  // Is the block already cached?
+-  for(b = bcache.head.next; b != &bcache.head; b = b->next){
++  for(b = bucket->head; b; b = b->next){
+     if(b->dev == dev && b->blockno == blockno){
+       b->refcnt++;
+-      release(&bcache.lock);
+-      acquiresleep(&b->lock);
+       return b;
+     }
+   }
++  return 0;
++}
+ 
+-  // Not cached.
+-  // Recycle the least recently used (LRU) unused buffer.
+-  for(b = bcache.head.prev; b != &bcache.head; b = b->prev){
+-    if(b->refcnt == 0) {
+-      b->dev = dev;
+-      b->blockno = blockno;
+-      b->valid = 0;
+-      b->refcnt = 1;
+-      release(&bcache.lock);
+-      acquiresleep(&b->lock);
++// 在桶锁内摘下引用为 0 的块，并预留一个引用；双向链表可直接摘除。
++static void
++bremove(struct bucket *bucket, struct buf *b)
++{
++  if(b->prev)
++    b->prev->next = b->next;
++  else
++    bucket->head = b->next;
++  if(b->next)
++    b->next->prev = b->prev;
++  b->refcnt = 1;
++}
++
++// 调用者持有 evict；返回一个已预留、尚未加入目标桶的缓冲块。
++static struct buf*
++brecycle(void)
++{
++  struct buf *b;
++  struct bucket *bucket;
++
++  // 优先用尚未分配的块，避免扫描和迁移已有缓存。
++  if(bcache.free){
++    b = bcache.free;
++    bcache.free = b->next;
++    b->refcnt = 1;
++    return b;
++  }
++
++  // evict 保证块身份不变，桶锁保护引用计数；按环形游标找空闲块。
++  // 不维护全局 LRU，省去每次释放时移动链表的开销。
++  for(int i = 0; i < NBUF; i++){
++    b = &bcache.buf[bcache.cursor];
++    bcache.cursor = (bcache.cursor + 1) % NBUF;
++    bucket = &bcache.bucket[b->blockno % NBUCKETS];
++    acquire(&bucket->lock);
++    if(b->refcnt == 0){
++      bremove(bucket, b);
++      release(&bucket->lock);
+       return b;
+     }
++    release(&bucket->lock);
++  }
++
++  // 扫过的块可能刚被释放，锁住全部桶再复查，避免误报耗尽。
++  // 按编号递增加锁、逆序释放，保持统一顺序。
++  for(int i = 0; i < NBUCKETS; i++)
++    acquire(&bcache.bucket[i].lock);
++  b = 0;
++  for(int i = 0; i < NBUF; i++){
++    struct buf *candidate = &bcache.buf[bcache.cursor];
++    bcache.cursor = (bcache.cursor + 1) % NBUF;
++    if(candidate->refcnt == 0){
++      b = candidate;
++      bucket = &bcache.bucket[b->blockno % NBUCKETS];
++      bremove(bucket, b);
++      break;
++    }
+   }
++  for(int i = NBUCKETS - 1; i >= 0; i--)
++    release(&bcache.bucket[i].lock);
++  if(b)
++    return b;
+   panic("bget: no buffers");
+ }
+ 
++// 查找或分配唯一的 (dev, blockno) 缓存，返回时持有块的睡眠锁。
++static struct buf*
++bget(uint dev, uint blockno)
++{
++  struct buf *b;
++  struct bucket *bucket = &bcache.bucket[blockno % NBUCKETS];
++
++  acquire(&bucket->lock);
++  b = blookup(bucket, dev, blockno);
++  release(&bucket->lock);
++  if(b){
++    // 已增加引用，块不会被回收；等待睡眠锁前必须释放自旋锁。
++    acquiresleep(&b->lock);
++    return b;
++  }
++
++  // 必须先放桶锁再等 evict，避免反向加锁。
++  // 等待期间可能已有其他 CPU 插入该块，重查以避免重复副本。
++  acquire(&bcache.evict);
++  acquire(&bucket->lock);
++  b = blookup(bucket, dev, blockno);
++  release(&bucket->lock);
++  if(b){
++    release(&bcache.evict);
++    acquiresleep(&b->lock);
++    return b;
++  }
++
++  b = brecycle();
++  // 回收时已放开来源桶锁，再拿目标桶锁，不同时占用两个桶。
++  acquire(&bucket->lock);
++  b->dev = dev;
++  b->blockno = blockno;
++  // 更换块身份后旧数据失效，交给 bread 重新读盘。
++  b->valid = 0;
++  b->prev = 0;
++  b->next = bucket->head;
++  if(b->next)
++    b->next->prev = b;
++  bucket->head = b;
++  release(&bucket->lock);
++  release(&bcache.evict);
++
++  acquiresleep(&b->lock);
++  return b;
++}
++
+ // Return a locked buf with the contents of the indicated block.
+ struct buf*
+ bread(uint dev, uint blockno)
+@@ -111,43 +207,41 @@ bwrite(struct buf *b)
+   virtio_disk_rw(b, 1);
+ }
+ 
+-// Release a locked buffer.
+-// Move to the head of the most-recently-used list.
++// 先释放睡眠锁，再在桶锁内减引用；减引用前块身份不会改变。
+ void
+ brelse(struct buf *b)
+ {
++  struct bucket *bucket = &bcache.bucket[b->blockno % NBUCKETS];
++
+   if(!holdingsleep(&b->lock))
+     panic("brelse");
+ 
+   releasesleep(&b->lock);
+ 
+-  acquire(&bcache.lock);
++  // 引用归零仅表示可回收，数据仍保留在缓存中供下次命中。
++  acquire(&bucket->lock);
+   b->refcnt--;
+-  if (b->refcnt == 0) {
+-    // no one is waiting for it.
+-    b->next->prev = b->prev;
+-    b->prev->next = b->next;
+-    b->next = bcache.head.next;
+-    b->prev = &bcache.head;
+-    bcache.head.next->prev = b;
+-    bcache.head.next = b;
+-  }
+-  
+-  release(&bcache.lock);
++  release(&bucket->lock);
+ }
+ 
++// 调用者已有引用，所属桶不会改变；增加引用可防止日志提交前被回收。
+ void
+-bpin(struct buf *b) {
+-  acquire(&bcache.lock);
++bpin(struct buf *b)
++{
++  struct bucket *bucket = &bcache.bucket[b->blockno % NBUCKETS];
++
++  acquire(&bucket->lock);
+   b->refcnt++;
+-  release(&bcache.lock);
++  release(&bucket->lock);
+ }
+ 
++// 解除日志固定；最后一个引用释放后，该块才可被回收。
+ void
+-bunpin(struct buf *b) {
+-  acquire(&bcache.lock);
++bunpin(struct buf *b)
++{
++  struct bucket *bucket = &bcache.bucket[b->blockno % NBUCKETS];
++
++  acquire(&bucket->lock);
+   b->refcnt--;
+-  release(&bcache.lock);
++  release(&bucket->lock);
+ }
+-
+-
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index fa6a0ac..e9b79f7 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -14,20 +14,42 @@ void freerange(void *pa_start, void *pa_end);
+ extern char end[]; // first address after kernel.
+                    // defined by kernel.ld.
+ 
++// 复用空闲页的页首保存 next，不额外分配链表节点。
+ struct run {
+   struct run *next;
+ };
+ 
++// 每 CPU 一条空闲链表、一把锁，减少不同 CPU 之间的争用。
+ struct {
+   struct spinlock lock;
+   struct run *freelist;
+-} kmem;
++} kmem[NCPU];
++
++// 一次最多借 32 页，减少频繁借页，也限制持锁时间。
++#define STEAL_BATCH 32
+ 
+ void
+ kinit()
+ {
+-  initlock(&kmem.lock, "kmem");
++  // kmem 前缀供 kalloctest 汇总锁争用次数。
++  for(int i = 0; i < NCPU; i++)
++    initlock(&kmem[i].lock, "kmem");
+   freerange(end, (void*)PHYSTOP);
++
++  // 其他 CPU 仍在 main() 等待 started，此时可直接重分空闲页。
++  // 轮流放入 NCPU 条链表，避免启动时都向同一 CPU 借页。
++  push_off();
++  int id = cpuid();
++  struct run *r = kmem[id].freelist;
++  // 先取下整条链表再分散，避免页面同时挂在两条链表上。
++  kmem[id].freelist = 0;
++  for(int target = 0; r; target = (target + 1) % NCPU){
++    struct run *next = r->next;
++    r->next = kmem[target].freelist;
++    kmem[target].freelist = r;
++    r = next;
++  }
++  pop_off();
+ }
+ 
+ void
+@@ -56,10 +78,15 @@ kfree(void *pa)
+ 
+   r = (struct run*)pa;
+ 
+-  acquire(&kmem.lock);
+-  r->next = kmem.freelist;
+-  kmem.freelist = r;
+-  release(&kmem.lock);
++  // 关中断固定 CPU 编号；跨 CPU 的链表访问仍靠自旋锁互斥。
++  push_off();
++  int id = cpuid();
++  acquire(&kmem[id].lock);
++  // 归还当前 CPU 即可，不必回到最初分配它的 CPU。
++  r->next = kmem[id].freelist;
++  kmem[id].freelist = r;
++  release(&kmem[id].lock);
++  pop_off();
+ }
+ 
+ // Allocate one 4096-byte page of physical memory.
+@@ -70,11 +97,47 @@ kalloc(void)
+ {
+   struct run *r;
+ 
+-  acquire(&kmem.lock);
+-  r = kmem.freelist;
++  // 优先取本地空闲页，常见路径只需本地锁。
++  push_off();
++  int id = cpuid();
++  acquire(&kmem[id].lock);
++  r = kmem[id].freelist;
+   if(r)
+-    kmem.freelist = r->next;
+-  release(&kmem.lock);
++    kmem[id].freelist = r->next;
++  release(&kmem[id].lock);
++
++  // 本地为空才向其他 CPU 借页，此时已释放本地锁。
++  if(r == 0){
++    // 所有其他链表都要检查，未启用 CPU 的空闲页也能借用。
++    for(int offset = 1; offset < NCPU; offset++){
++      int donor = (id + offset) % NCPU;
++      acquire(&kmem[donor].lock);
++      r = kmem[donor].freelist;
++      struct run *last = r;
++      if(r){
++        for(int count = 1; count < STEAL_BATCH && last->next; count++)
++          last = last->next;
++        // 在来源锁内整段摘下，防止同一页被再次分配。
++        kmem[donor].freelist = last->next;
++        last->next = 0;
++      }
++      release(&kmem[donor].lock);
++
++      if(r){
++        // 摘下的页已独占：第一张返回，其余挂回本地。
++        // 先放来源锁再拿本地锁，避免相互借页时死锁。
++        if(r->next){
++          acquire(&kmem[id].lock);
++          last->next = kmem[id].freelist;
++          kmem[id].freelist = r->next;
++          release(&kmem[id].lock);
++        }
++        break;
++      }
++    }
++  }
++  // 取页和借页都结束后再恢复中断状态，保证途中 CPU 编号不变。
++  pop_off();
+ 
+   if(r)
+     memset((char*)r, 5, PGSIZE); // fill with junk
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..1e8b314
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++6

@@ -1,0 +1,357 @@
+diff --git a/kernel/console.c b/kernel/console.c
+index 343abd0..1bd2411 100644
+--- a/kernel/console.c
++++ b/kernel/console.c
+@@ -62,7 +62,9 @@ int consolewrite(int user_src, uint64 src, int n) {
+   for (i = 0; i < n; i++) {
+     char c;
+     if (either_copyin(&c, user_src, src + i, 1) == -1) break;
+-    uartputc(c);
++    // 持有 cons.lock 时不能睡眠，改用同步发送。
++    // 原 uartputc 在发送缓冲区满时会 sleep。
++    uartputc_sync(c);
+   }
+   release(&cons.lock);
+ 
+diff --git a/kernel/defs.h b/kernel/defs.h
+index ecea5e6..fa7335c 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -108,7 +108,7 @@ void            sched(void);
+ void            setproc(struct proc*);
+ void            sleep(void*, struct spinlock*);
+ void            userinit(void);
+-int             wait(uint64);
++int             wait(uint64, int);  // flags：0 阻塞，1 非阻塞。
+ void            wakeup(void*);
+ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 1607145..2d6a0f7 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -10,6 +10,12 @@ struct cpu cpus[NCPU];
+ 
+ struct proc proc[NPROC];
+ 
++// 状态名按题目输出为小写，runble 是规定拼写。
++static char *procstate_names[] = {
++    [UNUSED] "unused", [SLEEPING] "sleep", [RUNNABLE] "runble",
++    [RUNNING] "run", [ZOMBIE] "zombie",
++};
++
+ struct proc *initproc;
+ 
+ int nextpid = 1;
+@@ -271,6 +277,7 @@ int fork(void) {
+ // Caller must hold p->lock.
+ void reparent(struct proc *p) {
+   struct proc *pp;
++  int child_num = 0;  // 子进程序号从 0 开始，不是 PID。
+ 
+   for (pp = proc; pp < &proc[NPROC]; pp++) {
+     // this code uses pp->parent without holding pp->lock.
+@@ -281,6 +288,9 @@ void reparent(struct proc *p) {
+       // pp->parent can't change between the check and the acquire()
+       // because only the parent changes it, and we're the parent.
+       acquire(&pp->lock);
++      // 先输出子进程信息，再把它交给 init。
++      exit_info("proc %d exit, child %d, pid %d, name %s, state %s\n",
++                p->pid, child_num++, pp->pid, pp->name, procstate_names[pp->state]);
+       pp->parent = initproc;
+       // we should wake up init here, but that would require
+       // initproc->lock, which would be a deadlock, since we hold
+@@ -322,21 +332,24 @@ void exit(int status) {
+   wakeup1(initproc);
+   release(&initproc->lock);
+ 
+-  // grab a copy of p->parent, to ensure that we unlock the same
+-  // parent we locked. in case our parent gives us away to init while
+-  // we're waiting for the parent lock. we may then race with an
+-  // exiting parent, but the result will be a harmless spurious wakeup
+-  // to a dead or wrong process; proc structs are never re-allocated
+-  // as anything else.
+-  acquire(&p->lock);
+-  struct proc *original_parent = p->parent;
+-  release(&p->lock);
+-
+-  // we need the parent's lock in order to wake it up from wait().
+-  // the parent-then-child rule says we have to lock it first.
+-  acquire(&original_parent->lock);
++  // 按父到子的顺序持锁；父指针若在等待期间变了，就重试。
++  struct proc *original_parent;
++  for (;;) {
++    acquire(&p->lock);
++    original_parent = p->parent;
++    // 先放开自己的锁，再等父锁，避免父子互相等待。
++    release(&p->lock);
++    acquire(&original_parent->lock);
++    acquire(&p->lock);
++    if (p->parent == original_parent) break;
++    release(&p->lock);
++    release(&original_parent->lock);
++  }
+ 
+-  acquire(&p->lock);
++  // 退出信息必须用 exit_info，不能直接用 printf。
++  exit_info("proc %d exit, parent pid %d, name %s, state %s\n",
++            p->pid, original_parent->pid, original_parent->name,
++            procstate_names[original_parent->state]);
+ 
+   // Give any children to init.
+   reparent(p);
+@@ -356,7 +369,7 @@ void exit(int status) {
+ 
+ // Wait for a child process to exit and return its pid.
+ // Return -1 if this process has no children.
+-int wait(uint64 addr) {
++int wait(uint64 addr, int flags) {
+   struct proc *np;
+   int havekids, pid;
+   struct proc *p = myproc();
+@@ -377,14 +390,17 @@ int wait(uint64 addr) {
+         // because only the parent changes it, and we're the parent.
+         acquire(&np->lock);
+         havekids = 1;
++        // 非阻塞等待也要回收僵尸进程，不能一进来就返回。
+         if (np->state == ZOMBIE) {
+           // Found one.
+           pid = np->pid;
++          // 用 copyout 向用户地址写回退出状态；addr 为 0 时不写回。
+           if (addr != 0 && copyout(p->pagetable, addr, (char *)&np->xstate, sizeof(np->xstate)) < 0) {
+             release(&np->lock);
+             release(&p->lock);
+             return -1;
+           }
++          // 回收资源并归还进程槽，成功时返回子进程 PID。
+           freeproc(np);
+           release(&np->lock);
+           release(&p->lock);
+@@ -395,12 +411,14 @@ int wait(uint64 addr) {
+     }
+ 
+     // No point waiting if we don't have any children.
+-    if (!havekids || p->killed) {
++    // 已先尝试回收；flags 为 1 时不再睡眠。
++    if (!havekids || p->killed || flags == 1) {
+       release(&p->lock);
+       return -1;
+     }
+ 
+     // Wait for a child to exit.
++    // 唤醒后重新扫描，检查是否已有子进程退出。
+     sleep(p, &p->lock);  // DOC: wait-sleep
+   }
+ }
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 4c97875..6ade3be 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -89,6 +89,8 @@ extern uint64 sys_wait(void);
+ extern uint64 sys_write(void);
+ extern uint64 sys_uptime(void);
+ extern uint64 sys_rename(void);
++// sys_yield 是系统调用入口，实现在 sysproc.c 中。
++extern uint64 sys_yield(void);
+ 
+ static uint64 (*syscalls[])(void) = {
+     [SYS_fork] sys_fork,   [SYS_exit] sys_exit,     [SYS_wait] sys_wait,     [SYS_pipe] sys_pipe,
+@@ -96,7 +98,8 @@ static uint64 (*syscalls[])(void) = {
+     [SYS_chdir] sys_chdir, [SYS_dup] sys_dup,       [SYS_getpid] sys_getpid, [SYS_sbrk] sys_sbrk,
+     [SYS_sleep] sys_sleep, [SYS_uptime] sys_uptime, [SYS_open] sys_open,     [SYS_write] sys_write,
+     [SYS_mknod] sys_mknod, [SYS_unlink] sys_unlink, [SYS_link] sys_link,     [SYS_mkdir] sys_mkdir,
+-    [SYS_close] sys_close, [SYS_rename] sys_rename,
++    // 用 SYS_yield 作为下标，将调用分发到 sys_yield。
++    [SYS_close] sys_close, [SYS_rename] sys_rename, [SYS_yield] sys_yield,
+ };
+ 
+ void syscall(void) {
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index a69071e..781eeb5 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -7,6 +7,9 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ 
++// 复用 proc.c 的进程表，扫描下一个就绪进程。
++extern struct proc proc[NPROC];
++
+ uint64 sys_exit(void) {
+   int n;
+   if (argint(0, &n) < 0) return -1;
+@@ -20,8 +23,10 @@ uint64 sys_fork(void) { return fork(); }
+ 
+ uint64 sys_wait(void) {
+   uint64 p;
+-  if (argaddr(0, &p) < 0) return -1;
+-  return wait(p);
++  int flags;
++  // 从保存的 a0、a1 取出状态地址和 flags，交给内核 wait。
++  if (argaddr(0, &p) < 0 || argint(1, &flags) < 0) return -1;
++  return wait(p, flags);
+ }
+ 
+ uint64 sys_sbrk(void) {
+@@ -81,3 +86,42 @@ uint64 sys_rename(void) {
+   p->name[len] = '\0';
+   return 0;
+ }
++
++// 先打印调度信息，再调用内核 yield 真正让出 CPU。
++uint64 sys_yield(void) {
++  struct proc *p = myproc();
++  // 没有其他就绪进程时，当前进程仍可再次被调度。
++  int next_pid = p->pid;
++  uint64 next_pc = p->trapframe->epc;
++  int current = p - proc;  // 指针相减得到当前进程在表中的下标。
++
++  // 关本核中断，保证单核观察稳定；其他核仍可能调度候选进程。
++  push_off();
++  // 从当前槽位之后环形查找，在锁内读取就绪进程的信息。
++  for (int offset = 1; offset < NPROC; offset++) {
++    struct proc *next = &proc[(current + offset) % NPROC];
++    acquire(&next->lock);
++    if (next->state == RUNNABLE) {
++      next_pid = next->pid;
++      next_pc = next->trapframe->epc;
++      // 只保存候选信息，离开循环前就释放锁。
++      release(&next->lock);
++      break;
++    }
++    release(&next->lock);
++  }
++
++  // context 区间左闭右开，共 112 字节；指针加 1 跨过整个结构体。
++  printf("Save the context of the process to the memory region from address %p to %p\n",
++         (uint64)&p->context, (uint64)(&p->context + 1));
++  // 用户态返回位置取 trapframe->epc，已跳过 ecall；不能用 context.ra。
++  printf("Current running process pid is %d and user pc is %p\n",
++         p->pid, p->trapframe->epc);
++  printf("Next runnable process pid is %d and user pc is %p\n", next_pid, next_pc);
++  // 先平衡额外的 push_off，再让 yield 持进程锁进入 sched。
++  pop_off();
++
++  // 变为 RUNNABLE 并进入调度器，被再次选中后从这里继续。
++  yield();
++  return 0;
++}
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..1e8b314
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++6
+diff --git a/user/printf.c b/user/printf.c
+index 8fcacab..6d172a7 100644
+--- a/user/printf.c
++++ b/user/printf.c
+@@ -6,9 +6,31 @@
+ 
+ static char digits[] = "0123456789ABCDEF";
+ 
+-static void putc(int fd, char c) { write(fd, &c, 1); }
++// 每次调用使用独立缓冲，短消息尽量一次写完，减少字符交错。
++// 超过 128 字节就分段输出，不保证长消息整体连续。
++struct printbuf {
++  int fd;
++  int used;
++  char data[128];
++};
+ 
+-static void printint(int fd, int xx, int base, int sgn) {
++static void flush(struct printbuf *out) {
++  int done = 0;
++  // write 可能只写出一部分，继续发送剩余内容。
++  while (done < out->used) {
++    int n = write(out->fd, out->data + done, out->used - done);
++    if (n <= 0) break;
++    done += n;
++  }
++  out->used = 0;
++}
++
++static void putc(struct printbuf *out, char c) {
++  out->data[out->used++] = c;
++  if (out->used == sizeof(out->data)) flush(out);
++}
++
++static void printint(struct printbuf *out, int xx, int base, int sgn) {
+   char buf[16];
+   int i, neg;
+   uint x;
+@@ -27,18 +49,19 @@ static void printint(int fd, int xx, int base, int sgn) {
+   } while ((x /= base) != 0);
+   if (neg) buf[i++] = '-';
+ 
+-  while (--i >= 0) putc(fd, buf[i]);
++  while (--i >= 0) putc(out, buf[i]);
+ }
+ 
+-static void printptr(int fd, uint64 x) {
++static void printptr(struct printbuf *out, uint64 x) {
+   int i;
+-  putc(fd, '0');
+-  putc(fd, 'x');
+-  for (i = 0; i < (sizeof(uint64) * 2); i++, x <<= 4) putc(fd, digits[x >> (sizeof(uint64) * 8 - 4)]);
++  putc(out, '0');
++  putc(out, 'x');
++  for (i = 0; i < (sizeof(uint64) * 2); i++, x <<= 4) putc(out, digits[x >> (sizeof(uint64) * 8 - 4)]);
+ }
+ 
+ // Print to the given fd. Only understands %d, %x, %p, %s.
+ void vprintf(int fd, const char *fmt, va_list ap) {
++  struct printbuf out = { .fd = fd, .used = 0 };
+   char *s;
+   int c, i, state;
+ 
+@@ -49,36 +72,38 @@ void vprintf(int fd, const char *fmt, va_list ap) {
+       if (c == '%') {
+         state = '%';
+       } else {
+-        putc(fd, c);
++        putc(&out, c);
+       }
+     } else if (state == '%') {
+       if (c == 'd') {
+-        printint(fd, va_arg(ap, int), 10, 1);
++        printint(&out, va_arg(ap, int), 10, 1);
+       } else if (c == 'l') {
+-        printint(fd, va_arg(ap, uint64), 10, 0);
++        printint(&out, va_arg(ap, uint64), 10, 0);
+       } else if (c == 'x') {
+-        printint(fd, va_arg(ap, int), 16, 0);
++        printint(&out, va_arg(ap, int), 16, 0);
+       } else if (c == 'p') {
+-        printptr(fd, va_arg(ap, uint64));
++        printptr(&out, va_arg(ap, uint64));
+       } else if (c == 's') {
+         s = va_arg(ap, char *);
+         if (s == 0) s = "(null)";
+         while (*s != 0) {
+-          putc(fd, *s);
++          putc(&out, *s);
+           s++;
+         }
+       } else if (c == 'c') {
+-        putc(fd, va_arg(ap, uint));
++        putc(&out, va_arg(ap, uint));
+       } else if (c == '%') {
+-        putc(fd, c);
++        putc(&out, c);
+       } else {
+         // Unknown % sequence.  Print it to draw attention.
+-        putc(fd, '%');
+-        putc(fd, c);
++        putc(&out, '%');
++        putc(&out, c);
+       }
+       state = 0;
+     }
+   }
++  // 没有换行也要刷新，保证提示符能及时显示。
++  flush(&out);
+ }
+ 
+ void fprintf(int fd, const char *fmt, ...) {

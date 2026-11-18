@@ -1,0 +1,2 @@
+| BSIZE = 1024 B |
+| Super(1) | Inode Map(1) | DATA Map(1) | INODE(32) | DATA(*) |

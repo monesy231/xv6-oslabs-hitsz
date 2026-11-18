@@ -1,0 +1,4 @@
+# 编译产物和 Python 缓存不进入实验提交。
+fs/*/build/
+__pycache__/
+*.pyc
