@@ -82,19 +82,43 @@ wait "$newfs_pid"
 
 两次 `ls` 均应显示 `notes.txt`。确认已卸载后，可删除 `test_home` 所指的临时目录。
 
-## 课程测试与实现范围
+## 课程测试
 
-`newfs` 课程脚本的 `N` 模式覆盖挂载、`mkdir`、`touch`、`ls`、重新挂载及磁盘位图检查。脚本会用 `ddriver -r` 清空 `$HOME/ddriver`，以下命令将测试镜像隔离在另一个临时目录，并在 `PATH` 中直接使用仓库提供的驱动脚本。测试环境还需允许脚本通过 `umount` 卸载该挂载点。
+任务一的课程脚本会把随机文件名写入测试镜像 `disk2`，挂载后检查 `ls` 输出。任务二选择 `N` 运行基础测试，脚本会调用 `ddriver -r` 清空 `$HOME/ddriver`，并用 `umount` 卸载文件系统。
+
+在 Git 检出的 `fuse-filesystem/` 目录执行。以下命令使用当前提交的临时副本，并为两项测试分别准备虚拟磁盘。
 
 ```bash
-course_home=$(mktemp -d)
-HOME="$course_home" DDRIVER_TYPE=u PATH="$PWD/driver/user_ddriver/bin:$PATH" \
-    bash fs/newfs/tests/test.sh
+course_workspace=$(mktemp -d)
+git -C .. archive HEAD fuse-filesystem | tar -x -C "$course_workspace"
+mkdir "$course_workspace/demo-home" "$course_workspace/newfs-home"
+cd "$course_workspace/fuse-filesystem"
+
+(
+    cd fs/demo/tests
+    env HOME="$course_workspace/demo-home" bash test.sh
+)
+
+env HOME="$course_workspace/newfs-home" DDRIVER_TYPE=u \
+    PATH="$PWD/driver/user_ddriver/bin:$PATH" bash fs/newfs/tests/test.sh
 # 出现提示后输入 N
 ```
 
-本分支的 `newfs` 覆盖必做项目，普通文件内容读写、删除、重命名、硬链接和崩溃恢复未实现。进阶题的 CheckpointFS 和 VectorFS 框架见[课程模板](fs/template/bonus/README.md)。
+若任务二报 `ddriver: command not found`，检查 `PATH` 是否包含本副本的 `driver/user_ddriver/bin`。清盘失败会让前面用例分配的 inode 留在镜像中，造成位图检查失败。
 
-两个目标均已编译。直接调用回调验证了 `demo` 读取目录项，以及 `newfs` 创建目录和空文件、正常卸载后恢复目录与时间戳。另用课程 `checkbm.py` 检查了根目录下仅有一个空文件时的 inode 位图、数据位图和目录项写回。当前验证环境缺少 `/dev/fuse`，真实挂载和课程脚本的完整测试需要在支持 FUSE 的 Linux 环境执行。
+## 验证结果
+
+2026-11-18 在 Linux 5.15、FUSE 2.9.9 环境中，用归档源码的独立副本和临时镜像实际挂载并复跑了两项课程测试。
+
+| 任务 | 课程测评结果 | 验证内容 |
+| --- | --- | --- |
+| `demo` | `Test Pass!!!` | 读取第 500 个逻辑块，挂载后的 `ls` 显示随机写入的文件名，并正常卸载 |
+| `newfs`（`N` 基础测试） | `Score: 30/30` | 挂载、创建多级目录和空文件、列目录、卸载后重挂载，以及 inode 和数据块位图检查 |
+
+手工复验时，卸载并重新挂载同一张临时镜像后，`docs/` 中仍可列出 `notes.txt`。
+
+## 实现范围
+
+本分支的 `newfs` 覆盖必做项目，普通文件内容读写、删除、重命名、硬链接和崩溃恢复未实现。进阶题的 CheckpointFS 和 VectorFS 框架见[课程模板](fs/template/bonus/README.md)。
 
 课程代码源自 HITSZ [用户态文件系统实验框架](https://gitee.com/ftutorials/user-land-filesystem)。从[实验总览](../README.md)可查看本分支收录的其他四项实验。
